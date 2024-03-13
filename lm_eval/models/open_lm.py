@@ -60,7 +60,7 @@ class OpenLMWrapper(HFLM):
     ) -> None:
         try:
             from open_lm.utils.transformers.hf_model import OpenLMforCausalLM  # noqa: F811
-            from open_lm.file_utils import pt_load # noqa: F811
+            from open_lm.main import load_model # noqa: F811
         except ModuleNotFoundError:
             raise Exception(
                 "attempted to use 'open_lm' LM type, but package `open_lm` is not installed." \
@@ -71,23 +71,13 @@ class OpenLMWrapper(HFLM):
 
         config = self._create_config_dict(pretrained)
 
-        # config.resume = self.checkpoint
-        # config.distributed = False
-        # import pdb; pdb.set_trace()
-        # load_strict = False
-        # if "load_strict"  in kwargs:
-        #     load_strict = bool(kwargs["load_strict"])
-        # config.load_not_strict = not load_strict
-        checkpoint = pt_load(self.checkpoint, map_location="cpu")
-
-        state_dict = checkpoint["state_dict"]
-        state_dict = {x.replace("module.", ""): y for x, y in state_dict.items()}
-        # Remove attention bias if it exists.
-        # It is just a trick to make the model causal and not actually a learned parameter
-        for k in list(state_dict.keys()):
-            if k.endswith("attention.bias") or k.endswith("inv_freq"):
-                del state_dict[k]
-        self._model.model.load_state_dict(state_dict)
+        config.resume = self.checkpoint
+        config.distributed = False
+        load_strict = False
+        if "load_strict"  in kwargs:
+            load_strict = bool(kwargs["load_strict"])
+        config.load_not_strict = not load_strict
+        load_model(config, self._model.model)
         self._model.model.eval()
 
     def _create_config_dict(self, pretrained: str, **kwargs) -> None:
