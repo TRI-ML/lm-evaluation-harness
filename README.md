@@ -50,6 +50,28 @@ We also provide a number of optional dependencies for extended functionality. A 
 
 ## Basic Usage
 
+### OpenLM 
+
+To evaluate an OpenLM model on `hellaswag` you can use the following command (this assumes you are using a CUDA-compatible GPU):
+
+```bash
+lm_eval --model open_lm \
+    --model_args config_file=<your params.txt file>,checkpoint=<your checkpoint>,pretrained=<model_name ex. open_lm_1b> \
+    --tasks hellaswag \
+    --device cuda:0 \
+    --batch_size 8
+```
+
+To perform *data-parallel evaluation* (where each GPU loads a **separate full copy** of the model), we leverage the `accelerate` launcher as follows:
+
+```
+accelerate launch -m lm_eval --model open_lm \
+    --model_args config_file=<your params.txt file>,checkpoint=<your checkpoint>,pretrained=<model_name ex. open_lm_1b> \
+    --tasks lambada_openai,arc_easy \
+    --batch_size 16
+```
+
+
 ### Hugging Face `transformers`
 
 To evaluate a model hosted on the [HuggingFace Hub](https://huggingface.co/models) (e.g. GPT-J-6B) on `hellaswag` you can use the following command (this assumes you are using a CUDA-compatible GPU):

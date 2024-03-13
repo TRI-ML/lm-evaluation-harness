@@ -38,6 +38,8 @@ class OpenLMWrapper(HFLM):
     def _get_config(
         self,
         pretrained: str,
+        revision: str = "main",
+        trust_remote_code: bool = False,
     ) -> None:
         try:
             from open_lm.model import create_params  # noqa: F811
@@ -73,8 +75,7 @@ class OpenLMWrapper(HFLM):
 
     def _create_model(
         self,
-        pretrained: str,
-        **kwargs,
+        **kwargs
     ) -> None:
         try:
             from open_lm.utils.transformers.hf_model import OpenLMforCausalLM  # noqa: F811
