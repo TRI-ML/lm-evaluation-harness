@@ -56,7 +56,7 @@ To evaluate an OpenLM model on `hellaswag` you can use the following command (th
 
 ```bash
 lm_eval --model open_lm \
-    --model_args config_file=<your params.txt file>,checkpoint=<your checkpoint>,pretrained=<model_name ex. open_lm_1b> \
+    --model_args config_file=<your params.txt file>,checkpoint=<your checkpoint>,pretrained=<model_name ex. open_lm_1b>,tokenizer=<your tokenizer> \
     --tasks hellaswag \
     --device cuda:0 \
     --batch_size 8
@@ -66,7 +66,7 @@ To perform *data-parallel evaluation* (where each GPU loads a **separate full co
 
 ```
 accelerate launch -m lm_eval --model open_lm \
-    --model_args config_file=<your params.txt file>,checkpoint=<your checkpoint>,pretrained=<model_name ex. open_lm_1b> \
+    --model_args config_file=<your params.txt file>,checkpoint=<your checkpoint>,pretrained=<model_name ex. open_lm_1b>,tokenizer=<your tokenizer> \
     --tasks lambada_openai,arc_easy \
     --batch_size 16
 ```
