@@ -4,11 +4,11 @@ from typing import List, Optional
 import yaml
 
 from lm_eval.api.registry import register_model
-from lm_eval.models.huggingface import HFLM
+from lm_eval.models.open_lm import OpenLMWrapper
 
 
-@register_model("open_lm")
-class OpenLMWrapper(HFLM):
+@register_model("mamba_open_lm")
+class MambaOpenLMWrapper(OpenLMWrapper):
     def __init__(
         self,
         pretrained: str,
@@ -24,6 +24,8 @@ class OpenLMWrapper(HFLM):
         self.checkpoint = checkpoint
         super().__init__(
             pretrained,
+            checkpoint=checkpoint,
+            config_file=config_file,
             backend=kwargs.pop("backend", "causal"),
             tokenizer=tokenizer,
             **kwargs,
@@ -37,7 +39,6 @@ class OpenLMWrapper(HFLM):
     ) -> None:
         try:
             from open_lm.model import create_params  # noqa: F811
-            from open_lm.utils.transformers.hf_config import OpenLMConfig  # noqa: F811
         except ModuleNotFoundError:
             raise Exception(
                 "attempted to use 'open_lm' LM type, but package `open_lm` is not installed." \
@@ -45,7 +46,7 @@ class OpenLMWrapper(HFLM):
             )
 
         config = self._create_config_dict(pretrained)
-        self._config = OpenLMConfig(create_params(config))
+        self._config = create_params(config)
 
     def _create_model(
         self,
@@ -53,7 +54,7 @@ class OpenLMWrapper(HFLM):
         **kwargs
     ) -> None:
         try:
-            from open_lm.utils.transformers.hf_model import OpenLMforCausalLM  # noqa: F811
+            from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel  # noqa: F811
             from open_lm.main import load_model # noqa: F811
         except ModuleNotFoundError:
             raise Exception(
@@ -61,7 +62,7 @@ class OpenLMWrapper(HFLM):
                 "please install open_lm from `https://github.com/TRI-ML/open_lm`",
             )
 
-        self._model = OpenLMforCausalLM(self._config)
+        self._model = MambaLMHeadModel(self._config)
 
         config = self._create_config_dict(pretrained)
 
@@ -71,35 +72,5 @@ class OpenLMWrapper(HFLM):
         if "load_strict"  in kwargs:
             load_strict = bool(kwargs["load_strict"])
         config.load_not_strict = not load_strict
-        load_model(config, self._model.model)
-        self._model.model.eval()
-
-    def _create_config_dict(self, pretrained: str, **kwargs) -> None:
-        try:
-            from open_lm.params import add_model_args, add_training_args  # noqa: F811
-        except ModuleNotFoundError:
-            raise Exception(
-                "attempted to use 'open_lm' LM type, but package `open_lm` is not installed." \
-                "please install open_lm from `https://github.com/TRI-ML/open_lm`",
-            )
-        parser = argparse.ArgumentParser()
-        add_training_args(parser)
-        add_model_args(parser)
-
-        config = parser.parse_args([])
-        config.model = pretrained
-
-        if self.config_file is not None:
-            with open(self.config_file, "r") as f:
-                config_to_override = yaml.safe_load(f)
-            for k, v in config_to_override.items():
-                if v == "None":
-                    v = None
-
-                # we changed args
-                if k == "batch_size":
-                    k = "per_gpu_batch_size"
-                if k == "val_batch_size":
-                    k = "per_gpu_val_batch_size"
-                setattr(config, k, v)
-        return config
+        load_model(config, self._model)
+        self._model.eval()
