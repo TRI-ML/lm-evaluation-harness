@@ -74,3 +74,27 @@ class MambaOpenLMWrapper(OpenLMWrapper):
         config.load_not_strict = not load_strict
         load_model(config, self._model)
         self._model.eval()
+
+
+    def _model_generate(self, context, max_length, stop, **generation_kwargs):
+        for key in ("do_sample", "attention_mask"):
+            if key in generation_kwargs:
+                generation_kwargs.pop(key)
+
+        # mamba's custom GenerationMixin currently does not support
+        # passing stopping criteria.
+        # for the time being, we simply generate to max length,
+        # then truncate (equivalent result)
+        # -- this should be revisited to speed up generation
+        # stopping_criteria = stop_sequences_criteria(
+        #     self.tokenizer, stop, 1, context.shape[0]
+        # )
+
+        return self.model.generate(
+            input_ids=context,
+            max_length=max_length,
+            # stopping_criteria=stopping_criteria,
+            # pad_token_id=self.tokenizer.pad_token_id,
+            # use_cache=True,
+            **generation_kwargs,
+        )
