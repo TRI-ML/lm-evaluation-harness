@@ -766,7 +766,7 @@ class HFLM(TemplateLM):
             max_length=max_length,
             stopping_criteria=stopping_criteria,
             pad_token_id=self.tokenizer.pad_token_id,
-            use_cache=True,
+            use_cache=False,
             **generation_kwargs,
         )
 
