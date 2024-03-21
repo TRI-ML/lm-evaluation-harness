@@ -68,11 +68,12 @@ class MambaOpenLMWrapper(OpenLMWrapper):
 
         config.resume = self.checkpoint
         config.distributed = False
-        load_strict = False
+        load_strict = True
         if "load_strict"  in kwargs:
             load_strict = bool(kwargs["load_strict"])
         config.load_not_strict = not load_strict
-        load_model(config, self._model)
+
+        load_model(config, self._model, remove_model_prefix=True)
         self._model.eval()
 
 
