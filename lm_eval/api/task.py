@@ -250,6 +250,7 @@ class Task(abc.ABC):
             - `datasets.DownloadMode.FORCE_REDOWNLOAD`
                 Fresh download and fresh dataset.
         """
+        breakpoint()
         self.dataset = datasets.load_dataset(
             path=self.DATASET_PATH,
             name=self.DATASET_NAME,
@@ -421,19 +422,8 @@ class Task(abc.ABC):
             if not isinstance(inst, list):
                 inst = [inst]
 
-            instances.append(inst)
-
-        # now flatten, this is to allow slicing to work with pickles
-
-        sliced_instances = instances[:og_limit]
-
-        flattened_instances = [
-            instance
-            for instance_group in sliced_instances
-            for instance in instance_group
-        ]
-
-        self._instances = flattened_instances
+            instances.extend(inst)
+        self._instances = instances
 
         assert len(self._instances) != 0, "task.build_requests() did not find any docs!"
 
