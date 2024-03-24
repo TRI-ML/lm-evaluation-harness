@@ -246,6 +246,7 @@ class Task(abc.ABC):
             - `datasets.DownloadMode.FORCE_REDOWNLOAD`
                 Fresh download and fresh dataset.
         """
+        breakpoint()
         self.dataset = datasets.load_dataset(
             path=self.DATASET_PATH,
             name=self.DATASET_NAME,
@@ -381,7 +382,6 @@ class Task(abc.ABC):
                 inst = [inst]
 
             instances.extend(inst)
-
         self._instances = instances
         assert len(self._instances) != 0, "task.build_requests() did not find any docs!"
 
