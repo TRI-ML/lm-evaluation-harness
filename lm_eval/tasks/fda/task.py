@@ -38,7 +38,6 @@ class FDA(ConfigurableTask):
     def construct_requests(self, doc, ctx, **kwargs):
         """Uses RequestFactory to construct Requests and returns an iterable of
         Requests which will be sent to the LM.
-
         :param doc:
             The document as returned from training_docs, validation_docs, or test_docs.
         :param ctx: str
@@ -61,7 +60,6 @@ class FDA(ConfigurableTask):
         """Take a single document and the LM results and evaluates, returning a
         dict where keys are the names of submetrics and values are the values of
         the metric for that one document
-
         :param doc:
             The document as returned from training_docs, validation_docs, or test_docs.
         :param results:
@@ -93,7 +91,6 @@ class FDA(ConfigurableTask):
         return {
             "contains": True,  # Exact match (the normalized answer exactly match the gold answer
         }
-    
 
 def contains_score(prediction: str, labels: List[str]):
     return max(
