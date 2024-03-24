@@ -11,8 +11,13 @@ from typing import Union
 import numpy as np
 
 from lm_eval import evaluator, utils
-from lm_eval.tasks import TaskManager, include_path, initialize_tasks
-from lm_eval.utils import make_table
+from lm_eval.evaluator import request_caching_arg_to_dict
+from lm_eval.logging_utils import WandbLogger
+from lm_eval.tasks import TaskManager
+from lm_eval.utils import make_table, simple_parse_args_string
+
+
+DEFAULT_RESULTS_FILE = "results.json"
 
 
 def _handle_non_serializable(o):
@@ -48,13 +53,30 @@ def _int_or_none_list_arg_type(max_len: int, value: str, split_char: str = ","):
     return items
 
 
-def parse_eval_args() -> argparse.Namespace:
+def check_argument_types(parser: argparse.ArgumentParser):
+    """
+    Check to make sure all CLI args are typed, raises error if not
+    """
+    for action in parser._actions:
+        if action.dest != "help" and not action.const:
+            if action.type is None:
+                raise ValueError(
+                    f"Argument '{action.dest}' doesn't have a type specified."
+                )
+            else:
+                continue
+
+
+def setup_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument("--model", "-m", default="hf", help="Name of model e.g. `hf`")
+    parser.add_argument(
+        "--model", "-m", type=str, default="hf", help="Name of model e.g. `hf`"
+    )
     parser.add_argument(
         "--tasks",
         "-t",
         default=None,
+        type=str,
         metavar="task1,task2",
         help="To get full list of tasks, use the command lm-eval --tasks list",
     )
@@ -62,6 +84,7 @@ def parse_eval_args() -> argparse.Namespace:
         "--model_args",
         "-a",
         default="",
+        type=str,
         help="Comma separated string arguments for model, e.g. `pretrained=EleutherAI/pythia-160m,dtype=float32`",
     )
     parser.add_argument(
@@ -118,7 +141,13 @@ def parse_eval_args() -> argparse.Namespace:
         metavar="DIR",
         help="A path to a sqlite db file for caching model responses. `None` if not caching.",
     )
-    parser.add_argument("--decontamination_ngrams_path", default=None)  # TODO: not used
+    parser.add_argument(
+        "--cache_requests",
+        type=str,
+        default=None,
+        choices=["true", "refresh", "delete"],
+        help="Speed up evaluation by caching the building of dataset requests. `None` if not caching.",
+    )
     parser.add_argument(
         "--check_integrity",
         action="store_true",
@@ -153,6 +182,7 @@ def parse_eval_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--gen_kwargs",
+        type=str,
         default=None,
         help=(
             "String arguments for model generation on greedy_until tasks,"
@@ -166,6 +196,12 @@ def parse_eval_args() -> argparse.Namespace:
         default="INFO",
         metavar="CRITICAL|ERROR|WARNING|INFO|DEBUG",
         help="Controls the reported logging error level. Set to DEBUG when testing + adding new task configurations for comprehensive log output.",
+    )
+    parser.add_argument(
+        "--wandb_args",
+        type=str,
+        default="",
+        help="Comma separated string arguments passed to wandb.init, e.g. `project=lm-eval,job_type=eval",
     )
     parser.add_argument(
         "--predict_only",
@@ -187,13 +223,28 @@ def parse_eval_args() -> argparse.Namespace:
             "E.g, `--seed 42` sets all three seeds to 42."
         ),
     )
+    parser.add_argument(
+        "--trust_remote_code",
+        action="store_true",
+        help="Sets trust_remote_code to True to execute code to create HF Datasets from the Hub",
+    )
+
+    return parser
+
+
+def parse_eval_args(parser: argparse.ArgumentParser) -> argparse.Namespace:
+    check_argument_types(parser)
     return parser.parse_args()
 
 
 def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
     if not args:
         # we allow for args to be passed externally, else we parse them ourselves
-        args = parse_eval_args()
+        parser = setup_parser()
+        args = parse_eval_args(parser)
+
+    if args.wandb_args:
+        wandb_logger = WandbLogger(**simple_parse_args_string(args.wandb_args))
 
     eval_logger = utils.eval_logger
     eval_logger.setLevel(getattr(logging, f"{args.verbosity}"))
@@ -203,9 +254,12 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
     if args.predict_only:
         args.log_samples = True
     if (args.log_samples or args.predict_only) and not args.output_path:
-        assert args.output_path, "Specify --output_path"
+        raise ValueError(
+            "Specify --output_path if providing --log_samples or --predict_only"
+        )
 
-    initialize_tasks(args.verbosity)
+    if args.include_path is not None:
+        eval_logger.info(f"Including path: {args.include_path}")
     task_manager = TaskManager(args.verbosity, include_path=args.include_path)
 
     if args.limit:
@@ -213,9 +267,6 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
             " --limit SHOULD ONLY BE USED FOR TESTING."
             "REAL METRICS SHOULD NOT BE COMPUTED USING LIMIT."
         )
-    if args.include_path is not None:
-        eval_logger.info(f"Including path: {args.include_path}")
-        include_path(args.include_path)
 
     if args.tasks is None:
         eval_logger.error("Need to specify task to evaluate.")
@@ -258,12 +309,13 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
     if args.output_path:
         path = Path(args.output_path)
         # check if file or 'dir/results.json' exists
-        if path.is_file() or Path(args.output_path).joinpath("results.json").is_file():
+        if path.is_file():
+            raise FileExistsError(f"File already exists at {path}")
+        output_path_file = path.joinpath(DEFAULT_RESULTS_FILE)
+        if output_path_file.is_file():
             eval_logger.warning(
-                f"File already exists at {path}. Results will be overwritten."
+                f"File {output_path_file} already exists. Results will be overwritten."
             )
-            output_path_file = path.joinpath("results.json")
-            assert not path.is_file(), "File already exists"
         # if path json then get parent dir
         elif path.suffix in (".json", ".jsonl"):
             output_path_file = path
@@ -271,10 +323,20 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
             path = path.parent
         else:
             path.mkdir(parents=True, exist_ok=True)
-            output_path_file = path.joinpath("results.json")
+
+    # Respect user's value passed in via CLI, otherwise default to True and add to comma-separated model args
+    if args.trust_remote_code:
+        os.environ["HF_DATASETS_TRUST_REMOTE_CODE"] = str(args.trust_remote_code)
+        args.model_args = (
+            args.model_args
+            + f",trust_remote_code={os.environ['HF_DATASETS_TRUST_REMOTE_CODE']}"
+        )
 
     eval_logger.info(f"Selected Tasks: {task_names}")
-    eval_logger.info("Loading selected tasks...")
+
+    request_caching_args = request_caching_arg_to_dict(
+        cache_requests=args.cache_requests
+    )
 
     results = evaluator.simple_evaluate(
         model=args.model,
@@ -286,16 +348,17 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
         device=args.device,
         use_cache=args.use_cache,
         limit=args.limit,
-        decontamination_ngrams_path=args.decontamination_ngrams_path,
         check_integrity=args.check_integrity,
         write_out=args.write_out,
         log_samples=args.log_samples,
         gen_kwargs=args.gen_kwargs,
         task_manager=task_manager,
+        verbosity=args.verbosity,
         predict_only=args.predict_only,
         random_seed=args.seed[0],
         numpy_random_seed=args.seed[1],
         torch_random_seed=args.seed[2],
+        **request_caching_args,
     )
 
     if results is not None:
@@ -308,6 +371,16 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
             print(dumped)
 
         batch_sizes = ",".join(map(str, results["config"]["batch_sizes"]))
+
+        # Add W&B logging
+        if args.wandb_args:
+            try:
+                wandb_logger.post_init(results)
+                wandb_logger.log_eval_result()
+                if args.log_samples:
+                    wandb_logger.log_eval_samples(samples)
+            except Exception as e:
+                eval_logger.info(f"Logging to Weights and Biases failed due to {e}")
 
         if args.output_path:
             output_path_file.open("w", encoding="utf-8").write(dumped)
@@ -333,6 +406,10 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
         print(make_table(results))
         if "groups" in results:
             print(make_table(results, "groups"))
+
+        if args.wandb_args:
+            # Tear down wandb run once all the logging is done.
+            wandb_logger.run.finish()
 
 
 if __name__ == "__main__":
