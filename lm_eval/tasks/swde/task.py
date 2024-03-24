@@ -96,7 +96,6 @@ class SWDE(ConfigurableTask):
             "contains": True,  # Exact match (the normalized answer exactly match the gold answer
         }
 
-
 def contains_score(prediction: str, labels: List[str]):
     return max(
         int(bool(re.search(re.compile(re.escape(label), re.IGNORECASE), prediction)))

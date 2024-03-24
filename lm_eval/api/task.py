@@ -260,6 +260,7 @@ class Task(abc.ABC):
             - `datasets.DownloadMode.FORCE_REDOWNLOAD`
                 Fresh download and fresh dataset.
         """
+        breakpoint()
         self.dataset = datasets.load_dataset(
             path=self.DATASET_PATH,
             name=self.DATASET_NAME,
@@ -430,7 +431,7 @@ class Task(abc.ABC):
             if not isinstance(inst, list):
                 inst = [inst]
 
-            instances.append(inst)
+            instances.extend(inst)
 
         # now flatten, this is to allow slicing to work with pickles
 
