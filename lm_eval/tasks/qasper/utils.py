@@ -4,7 +4,7 @@ from datasets import Dataset
 
 
 def process_docs(dataset, set_answer_type="bool"):
-    FEATURES = ["title", "abstract", "question", "answer", "answer_type"]
+    FEATURES = ["title", "abstract", "question", "full_text", "answer", "answer_type"]
 
     def _categorise_answer(answer_blob):
         if answer_blob["unanswerable"]:
@@ -37,18 +37,21 @@ def process_docs(dataset, set_answer_type="bool"):
         obs_list = {
             "title": [],
             "abstract": [],
+            "full_text": [],
             "question": [],
             "answer": [],
             "answer_type": [],
         }
         title = doc.pop("title")
         abstract = doc.pop("abstract")
+        full_text = doc.pop("full_text")
         for question, answer_list in zip(doc["qas"]["question"], doc["qas"]["answers"]):
             for answer_blob in answer_list["answer"]:
                 answer, answer_type = _categorise_answer(answer_blob)
                 if answer_type == set_answer_type:
                     obs_list["title"].append(title)
                     obs_list["abstract"].append(abstract)
+                    obs_list["full_text"].append(full_text)
                     obs_list["question"].append(question)
                     obs_list["answer_type"].append(answer_type)
                     if isinstance(answer, list):
