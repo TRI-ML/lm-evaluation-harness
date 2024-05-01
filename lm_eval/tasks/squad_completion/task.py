@@ -9,9 +9,9 @@ from lm_eval.api.task import ConfigurableTask
 from lm_eval.api.instance import Instance
 
 
-class FDA(ConfigurableTask):
+class SQUADCompletion(ConfigurableTask):
     VERSION = 0
-    DATASET_PATH = "hazyresearch/based-fda"
+    DATASET_PATH = "hazyresearch/based-squad"
     DATASET_NAME = "default"
 
     def __init__(self):
@@ -38,10 +38,7 @@ class FDA(ConfigurableTask):
     def construct_requests(self, doc, ctx, **kwargs):
         """Uses RequestFactory to construct Requests and returns an iterable of
         Requests which will be sent to the LM.
-<<<<<<< HEAD
-=======
 
->>>>>>> caaf9ab6 (upload new tasks (#1728))
         :param doc:
             The document as returned from training_docs, validation_docs, or test_docs.
         :param ctx: str
@@ -64,10 +61,7 @@ class FDA(ConfigurableTask):
         """Take a single document and the LM results and evaluates, returning a
         dict where keys are the names of submetrics and values are the values of
         the metric for that one document
-<<<<<<< HEAD
-=======
 
->>>>>>> caaf9ab6 (upload new tasks (#1728))
         :param doc:
             The document as returned from training_docs, validation_docs, or test_docs.
         :param results:
