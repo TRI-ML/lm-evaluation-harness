@@ -3,6 +3,7 @@ from . import (
     api_models,
     dummy,
     gguf,
+    hf_vlms,
     huggingface,
     mamba_lm,
     nemo_lm,
@@ -15,6 +16,7 @@ from . import (
     open_lm,
     mamba_open_lm,
     prismatic,
+    vllm_vlms,
 )
 
 
