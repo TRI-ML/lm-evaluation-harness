@@ -6,11 +6,11 @@ import yaml
 import fsspec
 import json
 from lm_eval.api.registry import register_model
-from lm_eval.models.huggingface import HFLM
+from lm_eval.models.vllm_causallms import VLLM
 from prismatic import load
 
 @register_model("prismatic")
-class PrismaticVLM(HFLM):
+class PrismaticVLM(VLLM):
     def __init__(
         self,
         pretrained: str,
@@ -21,9 +21,6 @@ class PrismaticVLM(HFLM):
         if "backend" in kwargs:
             # mamba currently only supports causal models
             assert kwargs["backend"] == "causal"
-        
-        pretrained = pretrained.replace("#", "=")
-        self.model_id = model_id.replace("#", "=")
         
         super().__init__(
             pretrained,
