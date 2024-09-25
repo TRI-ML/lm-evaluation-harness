@@ -2,7 +2,7 @@ import argparse
 from typing import List, Optional
 
 import yaml
-
+import fsspec
 from lm_eval.api.registry import register_model
 from lm_eval.models.huggingface import HFLM
 
@@ -76,21 +76,21 @@ class OpenLMWrapper(HFLM):
 
     def _create_config_dict(self, pretrained: str, **kwargs) -> None:
         try:
-            from open_lm.params import add_model_args, add_training_args  # noqa: F811
+            from open_lm.params import add_model_args#, add_training_args  # noqa: F811
         except ModuleNotFoundError:
             raise Exception(
                 "attempted to use 'open_lm' LM type, but package `open_lm` is not installed." \
                 "please install open_lm from `https://github.com/TRI-ML/open_lm`",
             )
         parser = argparse.ArgumentParser()
-        add_training_args(parser)
+        # add_training_args(parser)
         add_model_args(parser)
 
         config = parser.parse_args([])
         config.model = pretrained
 
         if self.config_file is not None:
-            with open(self.config_file, "r") as f:
+            with fsspec.open(self.config_file) as f:
                 config_to_override = yaml.safe_load(f)
             for k, v in config_to_override.items():
                 if v == "None":
