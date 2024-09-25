@@ -72,6 +72,8 @@ class OpenLMWrapper(HFLM):
             load_strict = bool(kwargs["load_strict"])
         config.load_not_strict = not load_strict
         checkpoint = pt_load(config.resume, map_location="cpu")
+        if "llm" in checkpoint:
+            checkpoint = checkpoint["llm"]
         if "model" in checkpoint:
             checkpoint = checkpoint["model"]
         if "llm_backbone" in checkpoint:
@@ -80,7 +82,7 @@ class OpenLMWrapper(HFLM):
             checkpoint = checkpoint["state_dict"]
         checkpoint = {k.replace("_orig_mod.", ""): v for k, v in checkpoint.items()}
         checkpoint = {k: v for k, v in checkpoint.items() if "inv_freq" not in k}
-        self._model.model.load_state_dict(checkpoint, strict=True)
+        self._model.model.load_state_dict(checkpoint, strict=load_strict)
         self._model.model.eval()
 
     def _create_config_dict(self, pretrained: str, **kwargs) -> None:

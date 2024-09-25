@@ -6,11 +6,11 @@ import yaml
 import fsspec
 import json
 from lm_eval.api.registry import register_model
-from lm_eval.models.vllm_causallms import VLLM
+from lm_eval.models.huggingface import HFLM
 from prismatic import load
 
 @register_model("prismatic")
-class PrismaticVLM(VLLM):
+class PrismaticVLM(HFLM):
     def __init__(
         self,
         pretrained: str,
