@@ -92,6 +92,13 @@ def sanitize_list(sub):
     else:
         return str(sub)
 
+def split_equal(string):
+    """
+    Splits a string on the first '=' character (can handle multiple '=' characters)
+    """
+    first_part = string.split("=", 1)[0]
+    second_part = "=".join(string.split("=", 1)[1:])
+    return first_part, second_part
 
 def simple_parse_args_string(args_string):
     """
@@ -104,7 +111,7 @@ def simple_parse_args_string(args_string):
         return {}
     arg_list = [arg for arg in args_string.split(",") if arg]
     args_dict = {
-        k: handle_arg_string(v) for k, v in [arg.split("=") for arg in arg_list]
+        k: handle_arg_string(v) for k, v in [split_equal(arg) for arg in arg_list]
     }
     return args_dict
 

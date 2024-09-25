@@ -54,7 +54,7 @@ class OpenLMWrapper(HFLM):
     ) -> None:
         try:
             from open_lm.utils.transformers.hf_model import OpenLMforCausalLM  # noqa: F811
-            from open_lm.main import load_model # noqa: F811
+            from open_lm.main import load_model, pt_load # noqa: F811
         except ModuleNotFoundError:
             raise Exception(
                 "attempted to use 'open_lm' LM type, but package `open_lm` is not installed." \
@@ -71,7 +71,12 @@ class OpenLMWrapper(HFLM):
         if "load_strict"  in kwargs:
             load_strict = bool(kwargs["load_strict"])
         config.load_not_strict = not load_strict
-        load_model(config, self._model.model)
+        checkpoint = pt_load(config.resume, map_location="cpu")
+        if "model" in checkpoint:
+            checkpoint = checkpoint["model"]
+        if "llm_backbone" in checkpoint:
+            checkpoint = checkpoint["llm_backbone"]
+        self._model.model.load_state_dict(checkpoint, strict=load_strict)
         self._model.model.eval()
 
     def _create_config_dict(self, pretrained: str, **kwargs) -> None:

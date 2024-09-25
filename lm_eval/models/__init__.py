@@ -14,7 +14,7 @@ from . import (
     textsynth,
     vllm_causallms,
     open_lm,
-    mamba_open_lm
+    mamba_open_lm,
     vllm_vlms,
 )
 
