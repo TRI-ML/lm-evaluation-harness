@@ -2,17 +2,18 @@ import copy
 import os
 from datetime import timedelta
 from pathlib import Path
-from typing import List, Literal, Optional, Tuple, Union
+from typing import Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 import transformers
 from accelerate import (
     Accelerator,
-    DistributedType,
     InitProcessGroupKwargs,
     find_executable_batch_size,
 )
+from accelerate.utils import get_max_memory
+from huggingface_hub import HfApi
 from packaging import version
 from peft import PeftModel
 from peft import __version__ as PEFT_VERSION
@@ -29,6 +30,7 @@ from lm_eval.api.registry import register_model
 from lm_eval.models.utils import (
     Collator,
     clear_torch_cache,
+    configure_pad_token,
     get_dtype,
     pad_and_concat,
     stop_sequences_criteria,
@@ -36,31 +38,6 @@ from lm_eval.models.utils import (
 
 
 eval_logger = utils.eval_logger
-
-
-def _get_accelerate_args(
-    device_map_option: Optional[str] = "auto",
-    max_memory_per_gpu: Optional[Union[int, str]] = None,
-    max_cpu_memory: Optional[Union[int, str]] = None,
-    offload_folder: Optional[str] = "./offload",
-) -> dict:
-    """Returns the kwargs needed to apply `accelerate` in `AutoModel.from_pretrained`."""
-    max_memory = {}
-    if max_memory_per_gpu is not None:
-        max_memory_per_gpu_map = {
-            device_idx: max_memory_per_gpu
-            for device_idx in range(torch.cuda.device_count())
-        }
-        max_memory.update(max_memory_per_gpu_map)
-    if max_cpu_memory is not None:
-        max_memory["cpu"] = max_cpu_memory
-
-    args = {}
-    if max_memory:
-        args["max_memory"] = max_memory
-    args["device_map"] = device_map_option
-    args["offload_folder"] = offload_folder
-    return args
 
 
 @register_model("hf-auto", "hf", "huggingface")
@@ -77,7 +54,7 @@ class HFLM(TemplateLM):
 
     def __init__(
         self,
-        pretrained: Optional[Union[str, transformers.PreTrainedModel]] = "gpt2",
+        pretrained: Union[str, transformers.PreTrainedModel],
         backend: Optional[Literal["default", "causal", "seq2seq"]] = "default",
         # override whether the model should be treated as decoder-only (causal) or encoder-decoder (seq2seq)
         revision: Optional[str] = "main",
@@ -99,15 +76,16 @@ class HFLM(TemplateLM):
         trust_remote_code: Optional[bool] = False,
         use_fast_tokenizer: Optional[bool] = True,
         add_bos_token: Optional[bool] = False,
+        prefix_token_id: Optional[int] = None,
         # arguments used for splitting a model across GPUs naively.
         # only used if `parallelize=True`.
         parallelize: Optional[bool] = False,
-        device_map_option: Optional[str] = "auto",
         max_memory_per_gpu: Optional[Union[int, str]] = None,
         max_cpu_memory: Optional[Union[int, str]] = None,
         offload_folder: Optional[Union[str, os.PathLike]] = "./offload",
-        # PEFT and quantization options
+        # PEFT, delta weights and quantization options
         peft: Optional[str] = None,
+        delta: Optional[str] = None,
         autogptq: Optional[Union[bool, str]] = False,
         **kwargs,
     ) -> None:
@@ -124,21 +102,6 @@ class HFLM(TemplateLM):
             self._config = self._model.config
             gpus = 0
 
-            if tokenizer:
-                assert isinstance(
-                    tokenizer, transformers.PreTrainedTokenizer
-                ) or isinstance(tokenizer, transformers.PreTrainedTokenizerFast)
-                self.tokenizer = tokenizer
-            else:
-                # Get tokenizer
-                model_name = self._model.name_or_path
-                self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-                    model_name,
-                    revision=revision,
-                    trust_remote_code=trust_remote_code,
-                    use_fast=use_fast_tokenizer,
-                )
-
         else:
             assert isinstance(device, str)
             assert isinstance(pretrained, str)
@@ -150,12 +113,17 @@ class HFLM(TemplateLM):
             if accelerator.num_processes > 1:
                 self.accelerator = accelerator
 
+            if "npu" in accelerator.device.type:
+                gpus = torch.npu.device_count()
+
+            # using one process with no model parallelism
             if not (parallelize or accelerator.num_processes > 1):
                 # use user-passed device
                 device_list = set(
                     ["cuda", "cpu"]
-                    + [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+                    + [f"cuda:{i}" for i in range(gpus)]
                     + ["mps", "mps:0"]
+                    + [f"npu:{i}" for i in range(gpus)]
                 )
                 if device and device in device_list:
                     self._device = torch.device(device)
@@ -174,14 +142,19 @@ class HFLM(TemplateLM):
                         if torch.cuda.is_available()
                         else torch.device("cpu")
                     )
-            else:
+            else:  # Parallelism managed by accelerate
                 if device != "cuda":
                     eval_logger.info(
                         f"Using `accelerate launch` or `parallelize=True`, device '{device}' will be overridden when placing model."
                     )
                 # TODO: include in warning that `load_in_8bit` etc. affect this too
-                self._device = torch.device(device)
+                self._device = (
+                    self.accelerator.device
+                    if hasattr(self, "accelerator")
+                    else torch.device(device)
+                )
 
+            revision = str(revision)  # cast to string if not already one
             # TODO: update this to be less of a hack once subfolder is fixed in HF
             revision = revision + ("/" + subfolder if subfolder is not None else "")
 
@@ -196,6 +169,15 @@ class HFLM(TemplateLM):
             config=self.config, backend=backend, trust_remote_code=trust_remote_code
         )
 
+        # load tokenizer so we know tokenizer vocabulary size before loading model and PEFT
+        self._create_tokenizer(
+            pretrained,
+            tokenizer,
+            revision=revision,
+            trust_remote_code=trust_remote_code,
+            use_fast_tokenizer=use_fast_tokenizer,
+        )
+
         # if we passed `pretrained` as a string, initialize our model now
         if isinstance(pretrained, str):
             self._create_model(
@@ -204,11 +186,12 @@ class HFLM(TemplateLM):
                 dtype=dtype,
                 trust_remote_code=trust_remote_code,
                 parallelize=parallelize,
-                device_map_option=device_map_option,
+                gpus=gpus,
                 max_memory_per_gpu=max_memory_per_gpu,
                 max_cpu_memory=max_cpu_memory,
                 offload_folder=offload_folder,
                 peft=peft,
+                delta=delta,
                 autogptq=autogptq,
                 **kwargs,
             )
@@ -218,64 +201,24 @@ class HFLM(TemplateLM):
             self.model.eval()
             self.model.tie_weights()
 
-        if isinstance(pretrained, str) and (gpus >= 1 or str(self.device) == "mps"):
-            # TODO: can remove this whole snippet except in the mps case, perhaps?
-            if not (parallelize or autogptq or hasattr(self, "accelerator")):
-                # place model onto device requested manually,
-                # if not using HF Accelerate or device_map
-                # or any other option that preloads model onto device
-                try:
-                    self.model.to(self.device)
-                except ValueError:
-                    eval_logger.debug(
-                        "Failed to place model onto specified device. This may be because the model is quantized via `bitsandbytes` or `device_map` is provided. If the desired GPU is being used, this message is safe to ignore."
-                    )
-
-        self._create_tokenizer(
-            pretrained,
-            tokenizer,
-            revision=revision,
-            trust_remote_code=trust_remote_code,
-            use_fast_tokenizer=use_fast_tokenizer,
-        )
-
         self.truncation = truncation
         self.logits_cache = logits_cache
         self.vocab_size = self.tokenizer.vocab_size
         # select (or create) a pad token to use
-        if self.tokenizer.pad_token:
-            pass
-        elif self.tokenizer.unk_token:
-            self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
-        elif self.tokenizer.eos_token:
-            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
-        else:
-            if getattr(self.config, "model_type", None) == "qwen":
-                # Qwen's trust_remote_code tokenizer does not allow for adding special tokens
-                self.tokenizer.pad_token = "<|endoftext|>"
-            elif (
-                self.tokenizer.__class__.__name__ == "RWKVWorldTokenizer"
-                or self.tokenizer.__class__.__name__ == "Rwkv5Tokenizer"
-            ):
-                # The RWKV world tokenizer, does not allow for adding special tokens / setting the pad token (which is set as 0)
-                # The additional tokenizer name check is needed, as there exists rwkv4 models with neox tokenizer
-                # ---
-                # Note that the world tokenizer class name, might change in the future for the final huggingface merge
-                # https://github.com/huggingface/transformers/pull/26963
-                assert self.tokenizer.pad_token_id == 0
-            else:
-                self.tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+        self.tokenizer = configure_pad_token(self.tokenizer, model_config=self.config)
 
-        # TODO: override this for Gemma
         self.add_bos_token = add_bos_token
-        if getattr(self.config, "model_type", None) == "gemma":
+        if "gemma" in getattr(self.config, "model_type", ""):
             self.add_bos_token = True
             eval_logger.info(
-                f"Model type is '{self.config.model_type}', a BOS token will be used as Gemma underperforms without it."
+                f"Model type is '{self.config.model_type}', part of the Gemma family--a BOS token will be used as Gemma underperforms without it."
             )
 
         self._max_length = max_length
-
+        self.pretrained = pretrained
+        self.delta = delta
+        self.peft = peft
+        self.revision = revision
         self.batch_schedule = 1
         self.batch_sizes = {}
         self.max_batch_size = max_batch_size
@@ -288,50 +231,46 @@ class HFLM(TemplateLM):
             self.batch_size_per_gpu = int(batch_size)
 
         if isinstance(pretrained, str):
+            if gpus >= 1 or str(self.device) == "mps":
+                # TODO: can remove this whole snippet except in the mps case, perhaps?
+                if not (parallelize or autogptq or hasattr(self, "accelerator")):
+                    # place model onto device requested manually,
+                    # if not using HF Accelerate or device_map
+                    # or any other option that preloads model onto device
+                    try:
+                        self.model.to(self.device)
+                    except ValueError:
+                        eval_logger.debug(
+                            "Failed to place model onto specified device. This may be because the model is quantized via `bitsandbytes` or `device_map` is provided. If the desired GPU is being used, this message is safe to ignore."
+                        )
             # multigpu data-parallel support when launched with accelerate
             if gpus > 1:
-                if parallelize:
-                    if accelerator.num_processes > 1:
-                        raise RuntimeError(
-                            "Attempted to use both a HF Accelerate `device_map` and to launch via `accelerate launch`. If this is the case, please either remove `parallelize=True` from --model_args or launch outside of the Accelerate launcher."
+                if accelerator.num_processes > 1:
+                    if parallelize:
+                        eval_logger.warning(
+                            "You are both using a HF Accelerate `device_map` (`--model_args parallelize=True`) and launching via `accelerate launch`. This will attempt to do model and data parallelism depending on the resources available."
                         )
-                    else:
-                        pass
-                elif accelerator.num_processes == 1:
-                    # if we aren't launching via accelerate, ditch
-                    self._rank = 0
-                    self._world_size = 1
-                else:
-                    if gpus > accelerator.num_processes:
+                    elif gpus > accelerator.num_processes:
                         eval_logger.warning(
                             "WARNING: The number of total system GPUs does not match the number of spawned processes. "
                             "If you would like to use data parallelism, please launch the script "
                             "with 'accelerate launch *script*'. "
                             f"Current run will proceed with {accelerator.num_processes} devices."
                         )
-                    assert (
-                        accelerator.distributed_type
-                        in [
-                            DistributedType.FSDP,
-                            DistributedType.MULTI_GPU,
-                        ]
-                    ), "Unsupported distributed type provided. Only DDP and FSDP are supported."
-                    if accelerator.distributed_type == DistributedType.FSDP:
-                        self._model = accelerator.prepare(self.model)
-                    else:
-                        self._model = accelerator.prepare_model(
-                            self.model, evaluation_mode=True
-                        )
-                    self._device = torch.device(
-                        f"cuda:{accelerator.local_process_index}"
-                    )
-                    self.accelerator = accelerator
+                        if self.accelerator.is_local_main_process:
+                            eval_logger.info(
+                                f"Using {gpus} devices with data parallelism"
+                            )
 
-                    if self.accelerator.is_local_main_process:
-                        eval_logger.info(f"Using {gpus} devices with data parallelism")
+                    self._device = torch.device(f"{accelerator.device}")
+                    self.accelerator = accelerator
 
                     self._rank = self.accelerator.local_process_index
                     self._world_size = self.accelerator.num_processes
+                else:
+                    # if we aren't launching via accelerate, ditch
+                    self._rank = 0
+                    self._world_size = 1
         else:
             # if a PreTrainedModel was passed into HFLM, we forgo distributed setup.
             eval_logger.warning(
@@ -339,6 +278,100 @@ class HFLM(TemplateLM):
             )
             self._rank = 0
             self._world_size = 1
+
+        self.custom_prefix_token_id = prefix_token_id
+        if prefix_token_id is not None:
+            eval_logger.info(
+                f"Loglikelihood prefix token id used in evaluation: {self.prefix_token_id}"
+            )
+
+    def _get_accelerate_args(
+        self,
+        parallelize: bool = None,
+        device_map: Optional[str] = "auto",
+        max_memory_per_gpu: Optional[Union[int, str]] = None,
+        max_cpu_memory: Optional[Union[int, str]] = None,
+        offload_folder: Optional[str] = "./offload",
+        gpus: Optional[int] = None,
+    ) -> dict:
+        """Returns the kwargs needed to apply `accelerate` in `AutoModel.from_pretrained`."""
+        num_local_processes = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
+        num_machines = int(os.environ.get("WORLD_SIZE", 0)) // num_local_processes
+        if (
+            num_machines == 0
+            and hasattr(self, "accelerator")
+            and self.accelerator is not None
+        ):
+            eval_logger.info(
+                "We are not in a distributed setting for accelerate. Setting model_parallel to False."
+            )
+            parallelize = False
+
+        if parallelize is None:
+            # If parallelism is unset by the user, we automatically assign model parallelism
+            # if enough extra GPUs are available
+            max_memory_all_gpus = get_max_memory()
+            # We just want gpu, not cpu, max memory
+            if "cpu" in max_memory_all_gpus:
+                del max_memory_all_gpus["cpu"]
+            parallelize = bool(num_local_processes < len(max_memory_all_gpus))
+            eval_logger.info(
+                f"Setting model parallel to {parallelize} since "
+                f"the number of local processes is {num_local_processes} "
+                f"and the number of GPUs is {len(max_memory_all_gpus)}"
+            )
+
+        args = {}
+        if parallelize:  # Model parallelism will be used
+            max_memory = {}
+            if max_memory_per_gpu is not None:  # Using the provided memory requirements
+                max_memory_per_gpu_map = {
+                    device_idx: max_memory_per_gpu for device_idx in range(gpus)
+                }
+            else:  # Estimating the possible memory requirements
+                max_memory_all_gpus = get_max_memory()
+                if "cpu" in max_memory_all_gpus:
+                    del max_memory_all_gpus["cpu"]
+                if not hasattr(self, "accelerator"):
+                    max_memory_per_gpu_map = {
+                        k: v for k, v in max_memory_all_gpus.items()
+                    }
+                else:
+                    # use only 1 / num_processes of the GPUs if we are running under accelerate launch
+                    max_memory_per_gpu_map = {
+                        k: v
+                        for k, v in max_memory_all_gpus.items()
+                        if k % num_local_processes
+                        == (self.accelerator.process_index % num_local_processes)
+                    }
+            args["max_memory"] = max_memory_per_gpu_map
+            args["device_map"] = "auto"
+            eval_logger.info(
+                f"Model parallel was set to True, setting max memory per GPU to {max_memory_per_gpu_map} and device map to 'auto'"
+            )
+
+            if max_cpu_memory is not None:
+                max_memory["cpu"] = max_cpu_memory
+
+            args["offload_folder"] = offload_folder
+        elif (
+            device_map is None
+        ):  # No model parallelism, we use the default provided device for our model
+            if hasattr(self, "accelerator"):
+                device_map = {"": f"{self.accelerator.device}"}
+            else:
+                device_map = {"": str(self.device)}
+            args["max_memory"] = None
+            args["device_map"] = device_map
+            eval_logger.info(
+                f"Model parallel was set to False, max memory was not set, and device map was set to {device_map}"
+            )
+        else:
+            args["max_memory"] = None
+            args["device_map"] = None
+            eval_logger.info("Model parallel was set to False.")
+
+        return args
 
     @property
     def config(self):
@@ -356,6 +389,15 @@ class HFLM(TemplateLM):
     @property
     def eot_token_id(self):
         # we use EOT because end of *text* is more accurate for what we're doing than end of *sentence*
+        return self.tokenizer.eos_token_id
+
+    @property
+    def prefix_token_id(self):
+        # it is used as prefix for loglikelihood
+        if self.custom_prefix_token_id is not None:
+            return self.custom_prefix_token_id
+        if self.tokenizer.bos_token_id is not None:
+            return self.tokenizer.bos_token_id
         return self.tokenizer.eos_token_id
 
     @property
@@ -392,6 +434,10 @@ class HFLM(TemplateLM):
     def world_size(self):
         return self._world_size
 
+    @property
+    def tokenizer_name(self) -> str:
+        return self.tokenizer.name_or_path.replace("/", "__")
+
     def _get_backend(
         self,
         config: Union[transformers.PretrainedConfig, transformers.AutoConfig],
@@ -402,7 +448,16 @@ class HFLM(TemplateLM):
         Helper method during initialization.
         Determines the backend ("causal" (decoder-only) or "seq2seq" (encoder-decoder))
         model type to be used.
+        sets `self.AUTO_MODEL_CLASS` appropriately if not already set.
         """
+        # escape hatch: if we're using a subclass that shouldn't follow
+        # the default _get_backend logic,
+        # then skip over the method.
+        # TODO: this seems very much undesirable in some cases--our code in HFLM
+        # references AutoModelForCausalLM at times to check for equality
+        if self.AUTO_MODEL_CLASS is not None:
+            return
+
         assert backend in ["default", "causal", "seq2seq"]
 
         if backend != "default":
@@ -466,12 +521,13 @@ class HFLM(TemplateLM):
         # only used if `parallelize=True`.
         # (accelerate naive PP (device_map) options)
         parallelize: Optional[bool] = False,
-        device_map_option: Optional[str] = "auto",
+        gpus: Optional[int] = None,
         max_memory_per_gpu: Optional[Union[int, str]] = None,
         max_cpu_memory: Optional[Union[int, str]] = None,
         offload_folder: Optional[str] = "./offload",
-        # PEFT and quantization options
+        # PEFT, delta weights and quantization options
         peft: Optional[str] = None,
+        delta: Optional[str] = None,
         autogptq: Optional[Union[bool, str]] = False,
         **kwargs,
     ) -> None:
@@ -489,26 +545,16 @@ class HFLM(TemplateLM):
 
         model_kwargs = kwargs if kwargs else {}
 
-        if parallelize:
-            model_kwargs.update(
-                _get_accelerate_args(
-                    device_map_option,  # TODO: phase out device_map_option?
-                    max_memory_per_gpu,
-                    max_cpu_memory,
-                    offload_folder,
-                )
+        model_kwargs.update(
+            self._get_accelerate_args(
+                parallelize=parallelize,
+                device_map=kwargs.get("device_map", None),
+                max_memory_per_gpu=max_memory_per_gpu,
+                max_cpu_memory=max_cpu_memory,
+                offload_folder=offload_folder,
+                gpus=gpus,
             )
-        elif "device_map" not in model_kwargs:
-            # set a device_map to initialize model on the right GPU.
-            # this is needed because it seems that the default behavior
-            # for quantized models now seems to be device_map="auto"
-            # which breaks data-parallel mode.
-            if hasattr(self, "accelerator"):
-                model_kwargs.update(
-                    {"device_map": {"": f"cuda:{self.accelerator.local_process_index}"}}
-                )
-            else:
-                model_kwargs.update({"device_map": {"": str(self.device)}})
+        )
 
         if not autogptq:
             if model_kwargs.get("load_in_4bit", None):
@@ -521,6 +567,7 @@ class HFLM(TemplateLM):
                         model_kwargs["bnb_4bit_compute_dtype"] = get_dtype(
                             model_kwargs["bnb_4bit_compute_dtype"]
                         )
+
             self._model = self.AUTO_MODEL_CLASS.from_pretrained(
                 pretrained,
                 revision=revision,
@@ -547,12 +594,47 @@ class HFLM(TemplateLM):
                 **model_kwargs,
             )
 
+        if peft and delta:
+            raise ValueError(
+                "Cannot use both 'peft' and 'delta' options at the same time."
+            )
+
         if peft:
             if model_kwargs.get("load_in_4bit", None):
-                assert PEFT_VERSION >= "0.4.0", "load_in_4bit requires peft >= 0.4.0"
+                if version.parse(PEFT_VERSION) < version.parse("0.4.0"):
+                    raise AssertionError("load_in_4bit requires peft >= 0.4.0")
+            if self._model.config.vocab_size != len(self.tokenizer):
+                # resize model for LoRAs with added tokens
+                eval_logger.info(
+                    f"Model config indicates vocab_size='{self._model.config.vocab_size}', but found tokenizer with vocab size '{len(self.tokenizer)}'. Resizing model embedding layer..."
+                )
+                self._model.resize_token_embeddings(len(self.tokenizer))
             self._model = PeftModel.from_pretrained(
                 self._model, peft, revision=revision
             )
+        elif delta:
+            if autogptq:
+                eval_logger.warning(
+                    "Delta weights might trigger unexpected behavior when used with AutoGPTQ."
+                )
+            _model_delta = self.AUTO_MODEL_CLASS.from_pretrained(
+                delta,
+                revision=revision,
+                torch_dtype=get_dtype(dtype),
+                trust_remote_code=trust_remote_code,
+                **model_kwargs,
+            )
+            for name, param in self._model.state_dict().items():
+                try:
+                    param.data += _model_delta.state_dict()[name]
+                except KeyError:
+                    raise KeyError(f"Delta model is missing weights for layer: {name}")
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Failed to add delta weights to layer {name}. Error: {e}"
+                    )
+
+            del _model_delta
 
         return None
 
@@ -615,6 +697,8 @@ class HFLM(TemplateLM):
             max_cont_enc = len(continuation_enc[-(self.max_length + 1) :])
         else:
             max_length = self.max_length
+            max_context_enc = max_length
+            max_cont_enc = max_length
 
         # if OOM, then halves batch_size and tries again
         @find_executable_batch_size(starting_batch_size=self.max_batch_size)
@@ -664,14 +748,21 @@ class HFLM(TemplateLM):
         self, string: str, left_truncate_len=None, add_special_tokens=None
     ) -> List[int]:
         """ """
+        # default for None - empty dict, use predefined tokenizer param
+        # used for all models except for CausalLM or predefined value
+        special_tokens_kwargs = {}
+
+        # by default for CausalLM - false or self.add_bos_token is set
         if add_special_tokens is None:
             if self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM:
-                add_special_tokens = False or self.add_bos_token
-            elif self.AUTO_MODEL_CLASS == transformers.AutoModelForSeq2SeqLM:
-                # TODO: investigate best practices for enc-dec models + special tokens
-                add_special_tokens = True
+                special_tokens_kwargs = {
+                    "add_special_tokens": False or self.add_bos_token
+                }
+        # otherwise the method explicitly defines the value
+        else:
+            special_tokens_kwargs = {"add_special_tokens": add_special_tokens}
 
-        encoding = self.tokenizer.encode(string, add_special_tokens=add_special_tokens)
+        encoding = self.tokenizer.encode(string, **special_tokens_kwargs)
 
         # left-truncate the encoded context to be at most `left_truncate_len` tokens long
         if left_truncate_len:
@@ -690,17 +781,16 @@ class HFLM(TemplateLM):
         old_padding_side = self.tokenizer.padding_side
         self.tokenizer.padding_side = padding_side
 
+        add_special_tokens = {}
         if self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM:
-            add_special_tokens = False or self.add_bos_token
-        elif self.AUTO_MODEL_CLASS == transformers.AutoModelForSeq2SeqLM:
-            add_special_tokens = True
+            add_special_tokens = {"add_special_tokens": False or self.add_bos_token}
 
         encoding = self.tokenizer(
             strings,
             truncation=truncation,
             padding="longest",
             return_tensors="pt",
-            add_special_tokens=add_special_tokens,
+            **add_special_tokens,
         )
         if left_truncate_len:
             encoding["input_ids"] = encoding["input_ids"][:, -left_truncate_len:]
@@ -711,11 +801,8 @@ class HFLM(TemplateLM):
 
         return encoding["input_ids"], encoding["attention_mask"]
 
-    def tok_decode(self, tokens):
-        if self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM:
-            return self.tokenizer.decode(tokens)
-        elif self.AUTO_MODEL_CLASS == transformers.AutoModelForSeq2SeqLM:
-            return self.tokenizer.decode(tokens, skip_special_tokens=True)
+    def tok_decode(self, tokens, skip_special_tokens=True):
+        return self.tokenizer.decode(tokens, skip_special_tokens=skip_special_tokens)
 
     def _model_call(self, inps, attn_mask=None, labels=None):
         """
@@ -790,7 +877,9 @@ class HFLM(TemplateLM):
 
         return logits
 
-    def loglikelihood_rolling(self, requests: List[Instance]) -> List[float]:
+    def loglikelihood_rolling(
+        self, requests: List[Instance], disable_tqdm: bool = False
+    ) -> List[float]:
         loglikelihoods = []
 
         adaptive_batch_size = None
@@ -801,13 +890,15 @@ class HFLM(TemplateLM):
             print(f"Determined Largest batch size: {batch_size}")
             adaptive_batch_size = batch_size
 
-        for (string,) in tqdm([req.args for req in requests], disable=(self.rank != 0)):
+        for (string,) in tqdm(
+            [req.args for req in requests], disable=(disable_tqdm or (self.rank != 0))
+        ):
             rolling_token_windows = list(
                 map(
                     utils.make_disjoint_window,
                     utils.get_rolling_token_windows(
                         token_list=self.tok_encode(string),
-                        prefix_token=self.eot_token_id,
+                        prefix_token=self.prefix_token_id,
                         max_seq_len=self.max_length,
                         context_len=1,
                     ),
@@ -843,6 +934,9 @@ class HFLM(TemplateLM):
 
             string_nll = sum(string_nll)
             loglikelihoods.append(string_nll)
+
+            # cache this loglikelihood_rolling request
+            self.cache_hook.add_partial("loglikelihood_rolling", (string,), string_nll)
 
         return loglikelihoods
 
@@ -1072,14 +1166,22 @@ class HFLM(TemplateLM):
 
                     res.append(answer)
 
-                    self.cache_hook.add_partial("loglikelihood", request_str, answer)
+                    if request_str is not None:
+                        # special case: loglikelihood_rolling produces a number of loglikelihood requests
+                        # all with cache key None. instead do add_partial on the per-example level
+                        # in the loglikelihood_rolling() function for those.
+                        self.cache_hook.add_partial(
+                            "loglikelihood", request_str, answer
+                        )
                     pbar.update(1)
 
         pbar.close()
 
         return re_ord.get_original(res)
 
-    def generate_until(self, requests: List[Instance]) -> List[str]:
+    def generate_until(
+        self, requests: List[Instance], disable_tqdm: bool = False
+    ) -> List[str]:
         res = []
 
         def _collate(req: Tuple[str, dict]):
@@ -1095,7 +1197,7 @@ class HFLM(TemplateLM):
 
         pbar = tqdm(
             total=len(requests),
-            disable=(self.rank != 0),
+            disable=(disable_tqdm or (self.rank != 0)),
             desc="Running generate_until requests",
         )
         adaptive_batch_size = None
@@ -1142,7 +1244,7 @@ class HFLM(TemplateLM):
                 if "until" in kwargs.keys():
                     until = kwargs.pop("until")
                     if isinstance(until, str):
-                        until = [kwargs]
+                        until = [until]
                     elif not isinstance(until, list):
                         raise ValueError(
                             f"Expected `kwargs['until']` to be of type Union[str,list] but got {until}"
@@ -1152,6 +1254,7 @@ class HFLM(TemplateLM):
                     f"Expected `kwargs` to be of type `dict` but got {type(gen_kwargs)}"
                 )
             # add EOS token to stop sequences
+            eos = self.tok_decode(self.eot_token_id, skip_special_tokens=False)
             if not until:
                 until = [self.tok_decode(self.eot_token_id)]
             if "max_gen_toks" in kwargs.keys():
@@ -1212,3 +1315,52 @@ class HFLM(TemplateLM):
         pbar.close()
 
         return res
+
+    def apply_chat_template(self, chat_history: List[Dict[str, str]]) -> str:
+        """
+        Method to apply a chat template to a list of chat history between user and model.
+        """
+        return self.tokenizer.apply_chat_template(
+            chat_history, tokenize=False, add_generation_prompt=True
+        )
+
+    def get_model_info(self) -> dict:
+        """
+        Method to get Hugging Face model information for experiment reproducibility.
+        """
+
+        def get_model_num_params(model) -> int:
+            if hasattr(model, "num_parameters"):
+                return model.num_parameters()
+            if hasattr(model, "parameters"):
+                return sum(p.numel() for p in model.parameters())
+            else:
+                return -1
+
+        def get_model_dtype(model) -> str:
+            if hasattr(model, "dtype"):
+                return model.dtype
+            else:
+                return ""
+
+        def get_model_sha(pretrained: str, revision: str) -> str:
+            try:
+                model_info = HfApi().model_info(repo_id=pretrained, revision=revision)
+                return model_info.sha
+            except Exception as e:
+                eval_logger.warn(
+                    f"Failed to get model SHA for {pretrained} at revision {revision}. Error: {e}"
+                )
+                return ""
+
+        model_info = {
+            "model_num_parameters": get_model_num_params(self._model),
+            "model_dtype": get_model_dtype(self._model),
+            "model_revision": self.revision,
+            "model_sha": get_model_sha(self.pretrained, self.revision),
+        }
+        if self.peft:
+            model_info["peft_sha"] = get_model_sha(self.peft, self.revision)
+        if self.delta:
+            model_info["delta_sha"] = get_model_sha(self.delta, self.revision)
+        return model_info

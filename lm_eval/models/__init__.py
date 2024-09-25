@@ -1,9 +1,13 @@
 from . import (
     anthropic_llms,
+    api_models,
     dummy,
     gguf,
+    hf_vlms,
     huggingface,
     mamba_lm,
+    nemo_lm,
+    neuralmagic,
     neuron_optimum,
     openai_completions,
     optimum_lm,
@@ -11,6 +15,7 @@ from . import (
     vllm_causallms,
     open_lm,
     mamba_open_lm
+    vllm_vlms,
 )
 
 

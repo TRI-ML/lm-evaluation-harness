@@ -1,15 +1,11 @@
-"""
-"""
-from typing import List
-import datasets
 
-from math import exp
-from functools import partial
 import re
+from typing import List
+
 import numpy as np
 
-from lm_eval.api.task import ConfigurableTask
 from lm_eval.api.instance import Instance
+from lm_eval.api.task import ConfigurableTask
 
 
 class SWDE(ConfigurableTask):
@@ -19,7 +15,6 @@ class SWDE(ConfigurableTask):
 
     def __init__(self):
         super().__init__(config={'metadata': {'version': self.VERSION}})
-
 
     def has_training_docs(self):
         return False
